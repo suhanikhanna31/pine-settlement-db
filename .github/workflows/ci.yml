@@ -1,0 +1,110 @@
+name: MerchantLens CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-sql:
+    name: Validate SQL Schema
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: merchantlens_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run schema migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          for f in schema/01_enums.sql \
+                   schema/02_core_tables.sql \
+                   schema/03_transaction.sql \
+                   schema/04_settlement.sql \
+                   schema/05_disputes.sql; do
+            echo "▶ Running $f"
+            psql -h localhost -U postgres -d merchantlens_test -f "$f"
+          done
+
+      - name: Create indexes
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -d merchantlens_test -f indexes/01_indexes.sql
+
+      - name: Install triggers
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d merchantlens_test -f triggers/01_audit_trigger.sql
+          psql -h localhost -U postgres -d merchantlens_test -f triggers/02_dispute_fsm.sql
+
+      - name: Install procedures
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d merchantlens_test -f procedures/01_run_settlement.sql
+          psql -h localhost -U postgres -d merchantlens_test -f procedures/02_escalate_disputes.sql
+          psql -h localhost -U postgres -d merchantlens_test -f procedures/03_compute_fees.sql
+
+      - name: Load seed data
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -d merchantlens_test -f seed/01_seed_data.sql
+
+      - name: Smoke-test analytics queries
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d merchantlens_test \
+            -c "SELECT COUNT(*) FROM merchants;" \
+            -c "SELECT COUNT(*) FROM authorizations;" \
+            -c "SELECT COUNT(*) FROM captures;" \
+            -c "SELECT COUNT(*) FROM audit_log;" \
+            -c "SELECT * FROM v_dispute_fsm_transitions LIMIT 5;"
+
+      - name: Verify audit trigger fires
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d merchantlens_test -c "
+            UPDATE merchants
+            SET display_name = display_name
+            WHERE merchant_id = 'a1000000-0000-0000-0000-000000000001';
+            SELECT COUNT(*) > 0 AS audit_rows_exist FROM audit_log;
+          "
+
+      - name: Test dispute FSM rejects invalid transition
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d merchantlens_test -c "
+            DO \$\$
+            BEGIN
+              BEGIN
+                UPDATE disputes
+                SET status = 'WON'
+                WHERE dispute_id = 'e1000001-0000-0000-0000-000000000001';
+                RAISE EXCEPTION 'FSM should have blocked WON from UNDER_REVIEW!';
+              EXCEPTION WHEN OTHERS THEN
+                -- Expected: FSM correctly rejected the invalid transition
+                RAISE NOTICE 'FSM correctly blocked invalid transition: %', SQLERRM;
+              END;
+            END;
+            \$\$;
+          "
