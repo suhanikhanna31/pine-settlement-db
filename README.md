@@ -125,17 +125,3 @@ Zudio Retail          |      4821 |            31 |         0.64
 Haldiram's Express    |      2103 |            29 |         1.38  ← alert threshold
 Chai Point            |      1897 |             8 |         0.42
 ```
-
----
-
-## Bullet Points (for resume / interview)
-
-1. **Designed a 12-table normalized PostgreSQL schema** for merchant settlement reconciliation, enforcing referential integrity and domain constraints at the database level across the full payment lifecycle (auth → capture → settlement → payout).
-
-2. **Built a reconciliation engine in SQL** using CTEs and multi-leg joins that surfaces unmatched, duplicate, and tolerance-breaching transactions against network settlement files, reducing manual reconciliation effort to zero for matched rows.
-
-3. **Implemented a chargeback state-machine trigger** in PL/pgSQL that blocks invalid dispute state transitions at the database layer, making lifecycle corruption impossible regardless of application-layer bugs.
-
-4. **Designed a composite + partial indexing strategy** (7 indexes, 3 partial) that reduced merchant analytics query time from full-table scans to index-only scans on a 1M-row transaction table, cutting p95 query latency by ~40×.
-
-5. **Wrote a settlement-run stored procedure** that atomically batches eligible captures, computes MDR/interchange fees, inserts settlement line items, and locks processed rows — all inside a single serializable transaction, eliminating double-settlement risk.
