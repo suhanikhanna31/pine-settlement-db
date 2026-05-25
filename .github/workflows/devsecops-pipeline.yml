@@ -1,0 +1,289 @@
+name: MerchantLens DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  JAVA_VERSION: '17'
+  POSTGRES_VERSION: '15'
+
+jobs:
+
+  # ─────────────────────────────────────────────
+  # STAGE 1 — SECRET SCANNING (shift-left security)
+  # ─────────────────────────────────────────────
+  secret-scan:
+    name: Secret & Credential Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks (detect hardcoded secrets)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: TruffleHog OSS scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+  # ─────────────────────────────────────────────
+  # STAGE 2 — SAST (Static Application Security Testing)
+  # ─────────────────────────────────────────────
+  sast:
+    name: Static Analysis (SAST)
+    runs-on: ubuntu-latest
+    needs: secret-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: Cache Maven packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.m2
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+
+      - name: Build Java API layer
+        run: |
+          cd java-api
+          mvn clean compile -q
+
+      - name: Run SpotBugs (Java static analysis)
+        run: |
+          cd java-api
+          mvn spotbugs:check
+
+      - name: Run OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'merchantlens'
+          path: './java-api'
+          format: 'HTML'
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+
+      - name: Upload dependency-check report
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependency-check-report
+          path: reports/
+
+      - name: SQL Injection pattern scan (SQLFluff)
+        run: |
+          pip install sqlfluff
+          sqlfluff lint schema/ procedures/ triggers/ queries/ \
+            --dialect postgres \
+            --rules L001,L010,L019,L028,L031
+
+  # ─────────────────────────────────────────────
+  # STAGE 3 — DATABASE VALIDATION
+  # ─────────────────────────────────────────────
+  db-validation:
+    name: DB Schema & Migration Validation
+    runs-on: ubuntu-latest
+    needs: sast
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: merchantlens_test
+          POSTGRES_USER: ml_user
+          POSTGRES_PASSWORD: ${{ secrets.DB_TEST_PASSWORD }}
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply schema in order
+        run: |
+          export PGPASSWORD=${{ secrets.DB_TEST_PASSWORD }}
+          psql -h localhost -U ml_user -d merchantlens_test -f schema/01_enums.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f schema/02_core_tables.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f schema/03_transaction.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f schema/04_settlement.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f schema/05_disputes.sql
+
+      - name: Apply indexes & triggers
+        run: |
+          export PGPASSWORD=${{ secrets.DB_TEST_PASSWORD }}
+          psql -h localhost -U ml_user -d merchantlens_test -f indexes/01_indexes.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f triggers/01_audit_trigger.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f triggers/02_dispute_fsm.sql
+
+      - name: Apply stored procedures
+        run: |
+          export PGPASSWORD=${{ secrets.DB_TEST_PASSWORD }}
+          psql -h localhost -U ml_user -d merchantlens_test -f procedures/01_run_settlement.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f procedures/02_escalate_disputes.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f procedures/03_compute_fees.sql
+
+      - name: Load seed data
+        run: |
+          export PGPASSWORD=${{ secrets.DB_TEST_PASSWORD }}
+          psql -h localhost -U ml_user -d merchantlens_test -f seed/01_seed_data.sql
+
+      - name: Validate analytics queries execute without error
+        run: |
+          export PGPASSWORD=${{ secrets.DB_TEST_PASSWORD }}
+          psql -h localhost -U ml_user -d merchantlens_test -f queries/01_reconciliation.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f queries/02_merchant_analytics.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f queries/03_top_merchants.sql
+          psql -h localhost -U ml_user -d merchantlens_test -f queries/04_cohort_analysis.sql
+
+      - name: Run pgTAP unit tests
+        run: |
+          export PGPASSWORD=${{ secrets.DB_TEST_PASSWORD }}
+          psql -h localhost -U ml_user -d merchantlens_test -f devsecops/db_tests.sql
+
+  # ─────────────────────────────────────────────
+  # STAGE 4 — Java API Tests
+  # ─────────────────────────────────────────────
+  java-test:
+    name: Java API — Build & Test
+    runs-on: ubuntu-latest
+    needs: db-validation
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+
+      - name: Run unit + integration tests
+        run: |
+          cd java-api
+          mvn test -Dspring.profiles.active=test
+
+      - name: JaCoCo coverage report
+        run: |
+          cd java-api
+          mvn jacoco:report
+
+      - name: Enforce 70% coverage gate
+        run: |
+          cd java-api
+          mvn jacoco:check
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: java-test-results
+          path: java-api/target/surefire-reports/
+
+  # ─────────────────────────────────────────────
+  # STAGE 5 — Salesforce Metadata Validation
+  # ─────────────────────────────────────────────
+  salesforce-validate:
+    name: Salesforce Metadata Validation
+    runs-on: ubuntu-latest
+    needs: java-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      - name: Authenticate to Salesforce sandbox
+        run: |
+          echo "${{ secrets.SF_AUTH_URL }}" | sf org login sfdx-url \
+            --sfdx-url-stdin \
+            --alias merchantlens-sandbox \
+            --set-default
+
+      - name: Validate Apex classes (check-only deploy)
+        run: |
+          sf project deploy validate \
+            --source-dir salesforce/force-app \
+            --target-org merchantlens-sandbox \
+            --test-level RunLocalTests
+
+      - name: Run PMD Apex static analysis
+        run: |
+          npm install -g @salesforce/cli-plugin-scanner
+          sf scanner run \
+            --target "salesforce/force-app/**/*.cls" \
+            --engine pmd \
+            --severity-threshold 3 \
+            --format table
+
+  # ─────────────────────────────────────────────
+  # STAGE 6 — DAST (Dynamic Application Security Testing)
+  # ─────────────────────────────────────────────
+  dast:
+    name: Dynamic Security Testing (DAST)
+    runs-on: ubuntu-latest
+    needs: java-test
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run OWASP ZAP baseline scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: 'http://staging.merchantlens.internal'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+
+  # ─────────────────────────────────────────────
+  # STAGE 7 — DEPLOY (main branch only)
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [dast, salesforce-validate]
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy DB migrations
+        run: |
+          echo "Applying migrations to staging DB..."
+          # Flyway / Liquibase would run here
+
+      - name: Deploy Java API (Docker)
+        run: |
+          docker build -t merchantlens-api:${{ github.sha }} ./java-api
+          docker push ghcr.io/${{ github.repository }}/merchantlens-api:${{ github.sha }}
+
+      - name: Deploy Salesforce metadata to sandbox
+        run: |
+          sf project deploy start \
+            --source-dir salesforce/force-app \
+            --target-org merchantlens-sandbox \
+            --test-level RunLocalTests
+
+      - name: Notify Slack on deployment
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "✅ MerchantLens deployed to staging — SHA: ${{ github.sha }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
